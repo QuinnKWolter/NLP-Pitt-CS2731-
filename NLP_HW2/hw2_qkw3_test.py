@@ -2,114 +2,78 @@ import pandas as pd
 import numpy as np
 import torch
 import joblib
-import re
-import string
-import nltk
-from nltk.tokenize import word_tokenize
-from nltk.corpus import stopwords
-from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
-from sklearn.metrics import accuracy_score, precision_recall_fscore_support
-from torch.utils.data import Dataset, DataLoader
-import torch.nn as nn
+from sklearn.feature_selection import SelectKBest, chi2
+import argparse
+from qkw3_shared import clean_text, NeuralNet
 
-# Ensure necessary resources are available
-nltk.download('punkt')
-nltk.download('stopwords')
+parser = argparse.ArgumentParser(description='Generate predictions for diplomacy test dataset')
+parser.add_argument('--filename', type=str, default='diplomacy_test.csv',
+                   help='Input CSV file (default: diplomacy_test.csv)')
+args = parser.parse_args()
 
-# Load test dataset
-df_test = pd.read_csv("diplomacy_test.csv")
+df_test = pd.read_csv(args.filename)
 
-# Check for NaN values in 'intent' column and handle them
-if df_test['intent'].isnull().any():
-    df_test = df_test.dropna(subset=['intent'])  # Drop rows with NaN in 'intent'
-
-# Preprocess the test data
-def clean_text(text):
-    """ Tokenizes, lowercases, removes punctuation, and stopwords. """
-    text = text.lower()
-    text = re.sub(r'\d+', '', text)  # Remove numbers
-    text = text.translate(str.maketrans('', '', string.punctuation))  # Remove punctuation
-    tokens = word_tokenize(text)
-    tokens = [word for word in tokens if word not in stopwords.words('english')]
-    return ' '.join(tokens)
-
+print("[>] Preprocessing test data...")
 df_test['clean_text'] = df_test['text'].apply(clean_text)
 
-# Load vectorizers
-vectorizer_bow = joblib.load('vectorizer_bow.pkl')  # Load the saved BoW vectorizer
-vectorizer_tfidf = joblib.load('vectorizer_tfidf.pkl')  # Load the saved TF-IDF vectorizer
+print("[>] Loading vectorizers...")
+try:
+    vectorizer_bow = joblib.load('vectorizer_bow.pkl')
+    vectorizer_char = joblib.load('vectorizer_char.pkl')
+except FileNotFoundError as e:
+    raise FileNotFoundError("[X] Vectorizer files not found. Please run training script first.") from e
 
-# Transform test data
+print("[>] Transforming test data...")
 X_test_bow = vectorizer_bow.transform(df_test['clean_text'])
-X_test_tfidf = vectorizer_tfidf.transform(df_test['clean_text'])
+X_test_char = vectorizer_char.transform(df_test['clean_text'])
 
-# Load Logistic Regression Models
-logistic_bow_model = joblib.load('logistic_bow_model.pkl')
-logistic_tfidf_model = joblib.load('logistic_tfidf_model.pkl')
+print("[>] Loading models...")
+try:
+    bow_model = joblib.load('logistic_bow_model.pkl')
+    bow_selected_model = joblib.load('logistic_bow_selected_model.pkl')
+    char_selected_model = joblib.load('logistic_char_selected_model.pkl')
+except FileNotFoundError as e:
+    raise FileNotFoundError("[X] Model files not found - Please run training script first!") from e
 
-# Evaluate Logistic Regression Models
-y_test = df_test['intent']
+feature_selector = SelectKBest(chi2, k=1000)
+X_test_bow_selected = feature_selector.fit_transform(X_test_bow, np.zeros(X_test_bow.shape[0]))
 
-y_pred_bow = logistic_bow_model.predict(X_test_bow)
-y_pred_tfidf = logistic_tfidf_model.predict(X_test_tfidf)
+print("[>] Generating predictions...")
+y_pred_bow = bow_model.predict(X_test_bow)
+y_pred_bow_selected = bow_selected_model.predict(X_test_bow_selected)
+y_pred_char = char_selected_model.predict(X_test_char)
 
-accuracy_bow = accuracy_score(y_test, y_pred_bow)
-precision_bow, recall_bow, f1_bow, _ = precision_recall_fscore_support(y_test, y_pred_bow, average='binary')
+print("\n[>] Loading neural network model...")
+try:
+    nn_model = NeuralNet(1000)
+    nn_model.load_state_dict(torch.load('neural_net_model.pth'))
+    nn_model.eval()
+except FileNotFoundError as e:
+    raise FileNotFoundError("Neural network model file not found. Please run training script first.") from e
 
-accuracy_tfidf = accuracy_score(y_test, y_pred_tfidf)
-precision_tfidf, recall_tfidf, f1_tfidf, _ = precision_recall_fscore_support(y_test, y_pred_tfidf, average='binary')
-
-print("Logistic Regression BoW Results:", (accuracy_bow, precision_bow, recall_bow, f1_bow))
-print("Logistic Regression TF-IDF Results:", (accuracy_tfidf, precision_tfidf, recall_tfidf, f1_tfidf))
-
-# Define Neural Network Model
-class NeuralNet(nn.Module):
-    def __init__(self, input_dim):
-        super(NeuralNet, self).__init__()
-        self.fc1 = nn.Linear(input_dim, 128)
-        self.relu = nn.ReLU()
-        self.fc2 = nn.Linear(128, 2)
-    
-    def forward(self, x):
-        x = self.fc1(x)
-        x = self.relu(x)
-        x = self.fc2(x)
-        return x
-
-# Load Neural Network Model
-model = NeuralNet(X_test_tfidf.shape[1])
-model.load_state_dict(torch.load('neural_net_model.pth'))
-model.eval()
-
-# Prepare test dataset for neural network
-class TextDataset(Dataset):
-    def __init__(self, texts, vectorizer):
-        self.X = torch.tensor(vectorizer.transform(texts).toarray(), dtype=torch.float32)
-    
-    def __len__(self):
-        return len(self.X)
-    
-    def __getitem__(self, idx):
-        return self.X[idx]
-
-test_dataset = TextDataset(df_test['clean_text'], vectorizer_tfidf)
-test_dataloader = DataLoader(test_dataset, batch_size=32, shuffle=False)
-
-# Predict intents using Neural Network Model
-y_pred_nn = []
+print("[>] Generating neural network predictions...")
+X_test_tensor = torch.tensor(X_test_bow_selected.toarray(), dtype=torch.float32)
 with torch.no_grad():
-    for batch_X in test_dataloader:
-        outputs = model(batch_X)
-        _, predicted = torch.max(outputs, 1)
-        y_pred_nn.extend(predicted.numpy())
+    outputs = nn_model(X_test_tensor)
+    _, y_pred_nn = torch.max(outputs, 1)
+    y_pred_nn = y_pred_nn.numpy()
 
-# Create a DataFrame for submission
-submission_df = pd.DataFrame({
-    'id': df_test['id'],
-    'intent_bow': y_pred_bow,
-    'intent_tfidf': y_pred_tfidf,
-    'intent_nn': y_pred_nn
-})
+print("\n[!] Saving predictions...")
 
-# Save the submission file
-submission_df.to_csv('submission.csv', index=False)
+model_predictions = {
+    'bow_unigram': y_pred_bow,
+    'bow_selected': y_pred_bow_selected,
+    'char_tfidf': y_pred_char,
+    'neural_net': y_pred_nn
+}
+
+for model_name, preds in model_predictions.items():
+    submission = pd.DataFrame({
+        'id': df_test['id'],
+        'intent': preds
+    })
+    filename = f'qkw3_{model_name}_predictions.csv'
+    submission.to_csv(filename, index=False)
+    print(f"[>] Saved predictions to {filename}")
+
+print("\n[!] All predictions have been saved!")
